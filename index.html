@@ -789,16 +789,7 @@ function physicsStep(dt) {
 
   // ── Crash detection ──
   if (performance.now() < crashGraceUntil) return; // grace period at race start
-  if (Math.abs(bike.angle) > 1.45) { // ~83 degrees
-    doCrash();
-    return;
-  }
-  // Frame body collision (approximate as point 20px above CoM)
-  const frameY = bike.y - 20;
-  // Simple: if CoM is below any terrain segment directly above it
-  // Check if frame center penetrates terrain
-  const frameContact = wheelTerrainContact(bike.x, bike.y - 8);
-  if (frameContact.onGround && frameContact.penetration > 5) {
+  if (Math.abs(bike.angle) > 2.0) { // ~115 degrees — genuine tip-over
     doCrash();
     return;
   }
@@ -1256,7 +1247,7 @@ function setState(s) {
   } else if (s === 'PLAYING') {
     hideAllOverlays();
     timerStart = performance.now();
-    crashGraceUntil = performance.now() + 600; // 0.6s grace to let bike settle
+    crashGraceUntil = performance.now() + 1500; // 1.5s grace to let bike settle
     elapsedMs = 0;
     bike.everMoved = false;
     initAudio();
