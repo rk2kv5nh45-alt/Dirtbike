@@ -534,9 +534,9 @@ function resetBike(trackPts) {
   const tx = dx/len, ty = dy/len; // tangent
   const nx = -ty, ny = tx;        // normal (pointing "up" from surface)
 
-  // Place CoM above the start of track
-  bike.x = p0.x + tx*20;
-  bike.y = p0.y - (CFG.SUSP_REST + CFG.WHEEL_R + 10); // above surface
+  // Place CoM above the start of track, far enough that rear wheel is over terrain
+  bike.x = p0.x + tx * (Math.abs(CFG.REAR_AX.x) + 20);
+  bike.y = p0.y - (CFG.REAR_AX.y + CFG.SUSP_REST + CFG.WHEEL_R + 10); // above surface
   bike.vx = bike.vy = 0;
   bike.angle = Math.atan2(ty, tx); // align with track slope
   bike.omega = 0;
@@ -788,6 +788,7 @@ function physicsStep(dt) {
   if (!bike.frontOnGround) bike.frontSpin *= 0.99;
 
   // ── Crash detection ──
+  if (performance.now() < crashGraceUntil) return; // grace period at race start
   if (Math.abs(bike.angle) > 1.45) { // ~83 degrees
     doCrash();
     return;
@@ -1211,6 +1212,7 @@ function drawCustomLine() {
 // 9. GAME STATE MACHINE
 // ═══════════════════════════════════════════════
 let gameState = 'MENU'; // MENU | COUNTDOWN | PLAYING | CRASHED | FINISHED | DRAW
+let crashGraceUntil = 0; // timestamp: no crash detection before this
 let currentTrackIdx = 0;
 let timerStart = 0;
 let timerPaused = 0;
@@ -1254,6 +1256,7 @@ function setState(s) {
   } else if (s === 'PLAYING') {
     hideAllOverlays();
     timerStart = performance.now();
+    crashGraceUntil = performance.now() + 600; // 0.6s grace to let bike settle
     elapsedMs = 0;
     bike.everMoved = false;
     initAudio();
