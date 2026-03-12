@@ -491,307 +491,247 @@ function setTerrain(pts) {
 }
 
 // ═══════════════════════════════════════════════
-// 5. PHYSICS ENGINE
+// 5. PHYSICS ENGINE (two-particle)
 // ═══════════════════════════════════════════════
+
+const world = {
+  g:           1400,  // gravity px/s²
+  air:         0.995, // velocity damping factor (per 1/60 s)
+  restitution: 0.05,
+  friction:    0.75,
+};
+
 const bike = {
-  // Rigid body state
-  x: 0, y: 0,       // CoM world position
-  vx: 0, vy: 0,     // linear velocity
-  angle: 0,          // rotation (rad), 0=upright
-  omega: 0,          // angular velocity
+  // Two wheel particles
+  w1: { x:0, y:0, vx:0, vy:0 }, // rear wheel
+  w2: { x:0, y:0, vx:0, vy:0 }, // front wheel
+  wheelBase: 76,    // constraint distance (px)
+  distStiff: 0.45,
+  distDamp:  0.10,
+  maxDrive:  2200,
+  maxBrake:  3200,
 
-  // Suspension state (per wheel: compression offset along suspension axis)
-  suspR: CFG.SUSP_REST, // rear current length
-  suspF: CFG.SUSP_REST, // front current length
-  suspVR: 0, suspVF: 0, // suspension velocities
-
-  // Wheel world positions (computed)
-  rearWx: 0, rearWy: 0,
-  frontWx: 0, frontWy: 0,
-
-  // Wheel spin for visual
-  rearSpin: 0, frontSpin: 0,
+  // Derived state — updated every tick, used by renderer/camera/HUD
+  x: 0, y: 0,              // CoM world position
+  vx: 0, vy: 0,            // average velocity
+  angle: 0,                 // bike tilt angle (rad)
+  suspR: CFG.SUSP_REST,    // fixed (no separate suspension model)
+  suspF: CFG.SUSP_REST,
+  rearSpin:  0,
+  frontSpin: 0,
 
   // Input
-  throttle: 0, // [0,1]
-  brake: 0,    // [0,1]
-  leanInput: 0, // [-1,+1]
+  throttle:  0,   // [0,1]
+  brake:     0,   // [0,1]
+  leanInput: 0,   // [-1,+1]
 
-  // Ground contact flags
-  rearOnGround: false,
-  frontOnGround: false,
-
-  crashed: false,
-  finished: false,
+  // State flags
+  crashed:   false,
+  finished:  false,
   everMoved: false,
 };
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+// getWheelWorld: returns actual particle position (rear=w1, front=w2)
+// Signature kept compatible with renderer calls: getWheelWorld(axLocal, suspLen, angle)
+function getWheelWorld(axLocal) {
+  return axLocal.x < 0 ? { x: bike.w1.x, y: bike.w1.y }
+                       : { x: bike.w2.x, y: bike.w2.y };
+}
+
+// Closest point on a segment to (px,py)
+function closestOnSeg(px, py, ax, ay, bx, by) {
+  const abx = bx-ax, aby = by-ay;
+  const apx = px-ax, apy = py-ay;
+  const ab2 = abx*abx + aby*aby || 1e-9;
+  const t   = clamp((apx*abx + apy*aby) / ab2, 0, 1);
+  const cx  = ax + abx*t, cy = ay + aby*t;
+  const dx  = px-cx, dy = py-cy;
+  return { x: cx, y: cy, dist: Math.sqrt(dx*dx + dy*dy) };
+}
+
+// Collide a wheel particle against terrain: push-out + normal impulse + friction
+function wheelCollide(w) {
+  const R = CFG.WHEEL_R;
+  let bestDist = Infinity, best = null;
+  for (let i = 0; i < terrainSegs.length; i++) {
+    const s = terrainSegs[i];
+    if (w.x < Math.min(s.ax,s.bx)-R-2 || w.x > Math.max(s.ax,s.bx)+R+2) continue;
+    if (w.y < Math.min(s.ay,s.by)-R-40 || w.y > Math.max(s.ay,s.by)+R+2) continue;
+    const c = closestOnSeg(w.x, w.y, s.ax, s.ay, s.bx, s.by);
+    if (c.dist < bestDist) { bestDist = c.dist; best = { c, s }; }
+  }
+  if (!best || bestDist > R) return;
+
+  const { c } = best;
+  const dist = bestDist || 1e-9;
+  let nx = (w.x - c.x) / dist, ny = (w.y - c.y) / dist;
+  if (ny > 0.1) { nx = -nx; ny = -ny; } // ensure normal points up
+
+  // Push out of terrain
+  w.x += nx * (R - bestDist);
+  w.y += ny * (R - bestDist);
+
+  // Normal impulse (no-penetration)
+  const vn = w.vx*nx + w.vy*ny;
+  if (vn < 0) {
+    const jn = -(1 + world.restitution) * vn;
+    w.vx += nx * jn;
+    w.vy += ny * jn;
+  }
+
+  // Coulomb friction (tangential)
+  const tx = -ny, ty = nx;
+  const vt = w.vx*tx + w.vy*ty;
+  const maxF = world.friction * Math.abs(vn) + 40;
+  const jt = clamp(-vt, -maxF, maxF);
+  w.vx += tx * jt;
+  w.vy += ty * jt;
+}
+
+// Maintain fixed wheelbase distance between w1 and w2
+function applyDistanceConstraint() {
+  const w1 = bike.w1, w2 = bike.w2;
+  const dx = w2.x - w1.x, dy = w2.y - w1.y;
+  const dist = Math.hypot(dx, dy) || 1e-9;
+  const err  = dist - bike.wheelBase;
+  const nx   = dx/dist, ny = dy/dist;
+
+  // Position correction
+  const corr = err * bike.distStiff * 0.5;
+  w1.x += nx*corr;  w1.y += ny*corr;
+  w2.x -= nx*corr;  w2.y -= ny*corr;
+
+  // Velocity damping along constraint axis
+  const dvn  = (w2.vx-w1.vx)*nx + (w2.vy-w1.vy)*ny;
+  const damp = dvn * bike.distDamp * 0.5;
+  w1.vx += nx*damp;  w1.vy += ny*damp;
+  w2.vx -= nx*damp;  w2.vy -= ny*damp;
+}
+
+// Recompute bike.x/y/angle/vx/vy from particle state
+function updateBikeDerivedState() {
+  const w1 = bike.w1, w2 = bike.w2;
+  const a  = Math.atan2(w2.y - w1.y, w2.x - w1.x);
+  bike.angle = a;
+  // CoM sits 14px "above" the wheel-axle midpoint (CFG.REAR_AX.y = 14 = local-down offset)
+  const mx = (w1.x + w2.x) * 0.5;
+  const my = (w1.y + w2.y) * 0.5;
+  bike.x  = mx + 14 * Math.sin(a);
+  bike.y  = my - 14 * Math.cos(a);
+  bike.vx = (w1.vx + w2.vx) * 0.5;
+  bike.vy = (w1.vy + w2.vy) * 0.5;
+}
 
 function resetBike(trackPts) {
   if (!trackPts || trackPts.length < 2) return;
   const p0 = trackPts[0], p1 = trackPts[1];
-  const dx = p1.x-p0.x, dy = p1.y-p0.y;
-  const len = Math.hypot(dx,dy)||1;
-  const tx = dx/len, ty = dy/len; // tangent
-  const nx = -ty, ny = tx;        // normal (pointing "up" from surface)
+  const dx = p1.x - p0.x, dy = p1.y - p0.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const tx  = dx/len, ty = dy/len;         // tangent along surface
+  const nx  = ty,     ny = -tx;            // normal pointing up from surface
 
-  // Place CoM above the start of track, far enough that rear wheel is over terrain
-  bike.x = p0.x + tx * (Math.abs(CFG.REAR_AX.x) + 20);
-  bike.y = p0.y - (CFG.REAR_AX.y + CFG.SUSP_REST + CFG.WHEEL_R + 10); // above surface
-  bike.vx = bike.vy = 0;
-  bike.angle = Math.atan2(ty, tx); // align with track slope
-  bike.omega = 0;
-  bike.suspR = bike.suspF = CFG.SUSP_REST;
-  bike.suspVR = bike.suspVF = 0;
-  bike.crashed = false;
-  bike.finished = false;
+  const offset = CFG.WHEEL_R + 2;
+  bike.w1.x = p0.x + tx*30          + nx*offset;
+  bike.w1.y = p0.y + ty*30          + ny*offset;
+  bike.w2.x = p0.x + tx*(30 + bike.wheelBase) + nx*offset;
+  bike.w2.y = p0.y + ty*(30 + bike.wheelBase) + ny*offset;
+  bike.w1.vx = bike.w1.vy = 0;
+  bike.w2.vx = bike.w2.vy = 0;
+
+  bike.crashed   = false;
+  bike.finished  = false;
   bike.everMoved = false;
-  bike.rearOnGround = false;
-  bike.frontOnGround = false;
-  bike.rearSpin = bike.frontSpin = 0;
-}
+  bike.rearSpin  = bike.frontSpin = 0;
+  bike.throttle  = 0;
+  bike.brake     = 0;
+  bike.leanInput = 0;
+  bike.suspR     = CFG.SUSP_REST;
+  bike.suspF     = CFG.SUSP_REST;
 
-function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
-
-function rot(lx, ly, angle) {
-  const c = Math.cos(angle), s = Math.sin(angle);
-  return { x: lx*c - ly*s, y: lx*s + ly*c };
-}
-
-// Get wheel world position given current bike state and suspension compression
-function getWheelWorld(axLocal, suspLen, angle) {
-  // Axle attachment point in world space
-  const axW = rot(axLocal.x, axLocal.y, angle);
-  // Suspension hangs straight down in local space (local y axis)
-  const suspDir = rot(0, 1, angle); // local down = world down when upright
-  return {
-    x: bike.x + axW.x + suspDir.x * suspLen,
-    y: bike.y + axW.y + suspDir.y * suspLen
-  };
-}
-
-// Closest point on a segment to (px,py). Returns {x,y,t,dist}
-function closestOnSeg(px,py,ax,ay,bx,by) {
-  const abx=bx-ax, aby=by-ay;
-  const apx=px-ax, apy=py-ay;
-  const ab2=abx*abx+aby*aby||1e-9;
-  const t=clamp((apx*abx+apy*aby)/ab2,0,1);
-  const cx=ax+abx*t, cy=ay+aby*t;
-  const dx=px-cx, dy=py-cy;
-  return {x:cx,y:cy,t, dist:Math.sqrt(dx*dx+dy*dy)};
-}
-
-// Resolve wheel against terrain. Returns {onGround, nx,ny,tx,ty, contactX,contactY}
-function wheelTerrainContact(wx, wy) {
-  const R = CFG.WHEEL_R;
-  let bestDist = Infinity, best = null;
-  const segs = terrainSegs;
-  const checkRadius = R + 4;
-
-  for (let i = 0; i < segs.length; i++) {
-    const s = segs[i];
-    // Quick bounding skip
-    if (wx < Math.min(s.ax,s.bx)-checkRadius || wx > Math.max(s.ax,s.bx)+checkRadius) continue;
-    if (wy < Math.min(s.ay,s.by)-checkRadius-40 || wy > Math.max(s.ay,s.by)+checkRadius) continue;
-    const c = closestOnSeg(wx,wy,s.ax,s.ay,s.bx,s.by);
-    if (c.dist < bestDist) { bestDist=c.dist; best={c,s}; }
-  }
-
-  if (!best || bestDist > R+1) return { onGround:false };
-
-  const {c, s} = best;
-  const dx = wx - c.x, dy = wy - c.y;
-  const dist = bestDist || 1e-9;
-  let nx = dx/dist, ny = dy/dist;
-
-  // Ensure normal points away from ground (upward)
-  // The segment normal should point toward the side the wheel is on
-  if (ny > 0.1) { nx=-nx; ny=-ny; } // flip if pointing down
-
-  const tx = -ny, ty = nx; // tangent along surface
-
-  return {
-    onGround: true,
-    penetration: R - dist,
-    nx, ny, tx, ty,
-    contactX: c.x, contactY: c.y,
-  };
-}
-
-// Apply impulse at world point (rx,ry relative to CoM) to bike rigid body
-function applyImpulse(ix, iy, rx, ry) {
-  bike.vx += ix / CFG.BIKE_MASS;
-  bike.vy += iy / CFG.BIKE_MASS;
-  bike.omega += (rx * iy - ry * ix) / CFG.MOI;
+  updateBikeDerivedState();
 }
 
 function physicsStep(dt) {
   if (bike.crashed || bike.finished) return;
 
-  // Compute wheel world positions
-  const rW = getWheelWorld(CFG.REAR_AX, bike.suspR, bike.angle);
-  const fW = getWheelWorld(CFG.FRONT_AX, bike.suspF, bike.angle);
+  const w1 = bike.w1, w2 = bike.w2;
 
-  // ── Suspension forces ──
-  // Suspension axis: local down direction in world
-  const suspDirX = Math.sin(bike.angle);
-  const suspDirY = -Math.cos(bike.angle); // Wait: local y=down means world: sin(a), -cos(a) NO
-  // Actually local +y = down when angle=0. Rotation: local(0,1) -> world
-  const sdx = Math.sin(bike.angle), sdy = -Math.cos(bike.angle);
-  // Hmm, let me redo: local axes. When angle=0: local x = world x, local y = world -y (up)
-  // Actually I set local y = down (14px below CoM for axle), so:
-  // local(0,1) rotated = (sin(a), -cos(a))? Let's just use rot():
-  const suspDir = rot(0, 1, bike.angle); // local down
+  // Gravity
+  w1.vy += world.g * dt;
+  w2.vy += world.g * dt;
 
-  // Velocity of axle attachment points
-  const rAxW = rot(CFG.REAR_AX.x, CFG.REAR_AX.y, bike.angle);
-  const fAxW = rot(CFG.FRONT_AX.x, CFG.FRONT_AX.y, bike.angle);
-  const rAxVx = bike.vx + (-bike.omega * rAxW.y);
-  const rAxVy = bike.vy + ( bike.omega * rAxW.x);
-  const fAxVx = bike.vx + (-bike.omega * fAxW.y);
-  const fAxVy = bike.vy + ( bike.omega * fAxW.x);
+  // Air drag (frame-rate independent)
+  const airDamp = Math.pow(world.air, dt * 60);
+  w1.vx *= airDamp;  w1.vy *= airDamp;
+  w2.vx *= airDamp;  w2.vy *= airDamp;
 
-  // Suspension velocity along suspension axis
-  const rSuspV = rAxVx * suspDir.x + rAxVy * suspDir.y;
-  const fSuspV = fAxVx * suspDir.x + fAxVy * suspDir.y;
-
-  // Spring forces (positive = pushing wheel away / upward on frame)
-  const rSpringF = CFG.REAR_K  * (CFG.SUSP_REST - bike.suspR) - CFG.REAR_D  * bike.suspVR;
-  const fSpringF = CFG.FRONT_K * (CFG.SUSP_REST - bike.suspF) - CFG.FRONT_D * bike.suspVF;
-
-  // Apply suspension force to frame (upward = negative suspDir)
-  const rSF_x = -suspDir.x * rSpringF, rSF_y = -suspDir.y * rSpringF;
-  const fSF_x = -suspDir.x * fSpringF, fSF_y = -suspDir.y * fSpringF;
-
-  // ── Gravity ──
-  const gfx = 0, gfy = CFG.GRAVITY * CFG.BIKE_MASS;
-
-  // Total force on frame
-  let fx = gfx + rSF_x + fSF_x;
-  let fy = gfy + rSF_y + fSF_y;
-  let torque = 0;
-
-  // Torques from suspension forces
-  torque += rAxW.x * rSF_y - rAxW.y * rSF_x;
-  torque += fAxW.x * fSF_y - fAxW.y * fSF_x;
-
-  // ── Lean / righting torque ──
-  const leanTorque = bike.leanInput * CFG.TILT_MAX;
-  const rightTorque = -Math.sin(bike.angle) * CFG.RIGHTING;
-  torque += leanTorque + rightTorque;
-
-  // ── Integrate frame ──
-  bike.vx += (fx / CFG.BIKE_MASS) * dt;
-  bike.vy += (fy / CFG.BIKE_MASS) * dt;
-  bike.omega += (torque / CFG.MOI) * dt;
-
-  // Air drag
-  bike.vx *= Math.pow(CFG.AIR_DRAG, dt * 60);
-  bike.vy *= Math.pow(CFG.AIR_DRAG, dt * 60);
-  bike.omega *= Math.pow(0.98, dt * 60);
-
-  bike.x += bike.vx * dt;
-  bike.y += bike.vy * dt;
-  bike.angle += bike.omega * dt;
-
-  // Integrate suspension
-  bike.suspVR += (rSuspV - bike.suspVR) * Math.min(1, dt * 20);
-  bike.suspVF += (fSuspV - bike.suspVF) * Math.min(1, dt * 20);
-  bike.suspR = clamp(bike.suspR + bike.suspVR * dt, CFG.SUSP_MIN, CFG.SUSP_MAX);
-  bike.suspF = clamp(bike.suspF + bike.suspVF * dt, CFG.SUSP_MIN, CFG.SUSP_MAX);
-
-  // ── Wheel terrain collision ──
-  const rW2 = getWheelWorld(CFG.REAR_AX,  bike.suspR, bike.angle);
-  const fW2 = getWheelWorld(CFG.FRONT_AX, bike.suspF, bike.angle);
-
-  function resolveWheel(wx, wy, axLocal, isRear) {
-    const contact = wheelTerrainContact(wx, wy);
-    if (!contact.onGround) {
-      if (isRear) bike.rearOnGround  = false;
-      else        bike.frontOnGround = false;
-      return;
-    }
-    if (isRear) bike.rearOnGround  = true;
-    else        bike.frontOnGround = true;
-
-    const {penetration, nx, ny, tx, ty, contactX, contactY} = contact;
-
-    // Attachment point world offset from CoM
-    const axW2 = rot(axLocal.x, axLocal.y, bike.angle);
-    // Contact point offset from CoM
-    const rx = contactX - bike.x;
-    const ry = contactY - bike.y;
-
-    // Velocity of contact point on bike
-    const vcx = bike.vx + (-bike.omega * ry);
-    const vcy = bike.vy + ( bike.omega * rx);
-
-    // Normal relative velocity
-    const vn = vcx * nx + vcy * ny;
-
-    if (vn < 0) {
-      // Normal impulse
-      const rCrossN = rx * ny - ry * nx;
-      const invMass = 1/CFG.BIKE_MASS + rCrossN*rCrossN/CFG.MOI;
-      const jn = -(1 + CFG.RESTITUTION) * vn / invMass;
-      applyImpulse(nx*jn, ny*jn, rx, ry);
-    }
-
-    // Position correction (Baumgarte)
-    const corr = penetration * 0.5;
-    bike.x += nx * corr;
-    bike.y += ny * corr;
-
-    // Compress suspension (wheel hit ground — push suspension up)
-    const suspPush = penetration * 0.6;
-    if (isRear) bike.suspR = clamp(bike.suspR - suspPush, CFG.SUSP_MIN, CFG.SUSP_MAX);
-    else        bike.suspF = clamp(bike.suspF - suspPush, CFG.SUSP_MIN, CFG.SUSP_MAX);
-
-    // Friction impulse
-    const vcx2 = bike.vx + (-bike.omega * ry);
-    const vcy2 = bike.vy + ( bike.omega * rx);
-    const vt = vcx2 * tx + vcy2 * ty;
-
-    const rCrossT = rx * ty - ry * tx;
-    const invMassT = 1/CFG.BIKE_MASS + rCrossT*rCrossT/CFG.MOI;
-    let jt = -vt / invMassT;
-
-    // Engine / brake force (only rear wheel for drive, both for brake)
-    if (isRear && bike.throttle > 0) {
-      const engineForce = bike.throttle * CFG.MAX_ENGINE * dt; // impulse units
-      jt += engineForce;
-    }
-    if (bike.brake > 0) {
-      const brakeF = bike.brake * (isRear ? CFG.MAX_BRAKE : CFG.MAX_BRAKE*0.4) * dt;
-      jt = clamp(jt - Math.sign(vt)*brakeF, -Math.abs(jt)-brakeF, Math.abs(jt)+brakeF);
-      // Hard stop
-      if (Math.abs(vt) < 5) jt = -vt / invMassT;
-    }
-
-    // Coulomb limit — use weight-based normal force, not just collision impulse
-    const staticNormal = CFG.BIKE_MASS * CFG.GRAVITY * dt;
-    const maxFriction = CFG.FRICTION * staticNormal + 50;
-    jt = clamp(jt, -maxFriction, maxFriction);
-
-    applyImpulse(tx*jt, ty*jt, rx, ry);
-
-    // Wheel spin (visual)
-    const speed = bike.vx * tx + bike.vy * ty;
-    if (isRear) bike.rearSpin  += speed * dt / CFG.WHEEL_R;
-    else        bike.frontSpin += speed * dt / CFG.WHEEL_R;
+  // Lean: opposing perpendicular impulses to tilt the bike
+  if (bike.leanInput !== 0) {
+    const a  = Math.atan2(w2.y - w1.y, w2.x - w1.x);
+    const F  = bike.leanInput * 400 * dt;
+    const px = Math.sin(a), py = -Math.cos(a); // "up" perpendicular to bike
+    w1.vx += px*F;  w1.vy += py*F;   // lift rear
+    w2.vx -= px*F;  w2.vy -= py*F;   // dip front
   }
 
-  resolveWheel(rW2.x, rW2.y, CFG.REAR_AX,  true);
-  resolveWheel(fW2.x, fW2.y, CFG.FRONT_AX, false);
+  // Integrate positions
+  w1.x += w1.vx * dt;  w1.y += w1.vy * dt;
+  w2.x += w2.vx * dt;  w2.y += w2.vy * dt;
 
-  // Wheel spin in air (slow down)
-  if (!bike.rearOnGround)  { bike.rearSpin  += bike.throttle * 8 * dt; bike.rearSpin  *= 0.98; }
-  if (!bike.frontOnGround) bike.frontSpin *= 0.99;
+  // Constraint + collision iterations
+  for (let i = 0; i < 5; i++) {
+    applyDistanceConstraint();
+    wheelCollide(w1);
+    wheelCollide(w2);
+  }
 
-  // ── Crash detection ──
-  if (performance.now() < crashGraceUntil) return; // grace period at race start
-  if (Math.abs(bike.angle) > 2.0) { // ~115 degrees — genuine tip-over
+  // Engine / brake — rear wheel (w1) drives, small coupling to front (w2)
+  const R = CFG.WHEEL_R;
+  let rearGrounded = false;
+  for (let i = 0; i < terrainSegs.length; i++) {
+    const s = terrainSegs[i];
+    if (w1.x < Math.min(s.ax,s.bx)-R-2 || w1.x > Math.max(s.ax,s.bx)+R+2) continue;
+    const c = closestOnSeg(w1.x, w1.y, s.ax, s.ay, s.bx, s.by);
+    if (c.dist <= R + 2) { rearGrounded = true; break; }
+  }
+
+  const bAngle = Math.atan2(w2.y - w1.y, w2.x - w1.x);
+  const ttx = Math.cos(bAngle), tty = Math.sin(bAngle); // forward tangent
+
+  if (rearGrounded && bike.throttle > 0) {
+    const F = bike.throttle * bike.maxDrive;
+    w1.vx += ttx * F * dt;
+    w1.vy += tty * F * dt;
+    w2.vx += ttx * F * 0.25 * dt;
+    w2.vy += tty * F * 0.25 * dt;
+  }
+
+  if (bike.brake > 0) {
+    const vt  = w1.vx*ttx + w1.vy*tty;
+    const brk = bike.brake * bike.maxBrake * dt;
+    const dv  = clamp(-vt, -brk, brk);
+    w1.vx += ttx * dv;     w1.vy += tty * dv;
+    w2.vx += ttx * dv*0.2; w2.vy += tty * dv*0.2;
+  }
+
+  // Wheel spin (visual)
+  const fwdSpeed = w1.vx*ttx + w1.vy*tty;
+  bike.rearSpin  += fwdSpeed * dt / CFG.WHEEL_R;
+  bike.frontSpin += (w2.vx*ttx + w2.vy*tty) * dt / CFG.WHEEL_R;
+  if (!rearGrounded) {
+    bike.rearSpin += bike.throttle * 8 * dt;
+    bike.rearSpin *= 0.98;
+  }
+
+  // Update derived state for renderer / camera / HUD
+  updateBikeDerivedState();
+
+  // Crash detection
+  if (performance.now() < crashGraceUntil) return;
+  if (Math.abs(bike.angle) > 1.6) { // ~92° — bike has flipped over
     doCrash();
-    return;
   }
 }
 
