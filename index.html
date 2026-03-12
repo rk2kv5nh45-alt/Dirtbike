@@ -757,7 +757,7 @@ function physicsStep(dt) {
 
     // Engine / brake force (only rear wheel for drive, both for brake)
     if (isRear && bike.throttle > 0) {
-      const engineForce = bike.throttle * CFG.MAX_ENGINE * dt / CFG.BIKE_MASS;
+      const engineForce = bike.throttle * CFG.MAX_ENGINE * dt; // impulse units
       jt += engineForce;
     }
     if (bike.brake > 0) {
@@ -767,9 +767,9 @@ function physicsStep(dt) {
       if (Math.abs(vt) < 5) jt = -vt / invMassT;
     }
 
-    // Coulomb limit
-    const normalImpulse = Math.max(0, -vn) / (1/CFG.BIKE_MASS) * dt;
-    const maxFriction = CFG.FRICTION * Math.abs(normalImpulse) + 5;
+    // Coulomb limit — use weight-based normal force, not just collision impulse
+    const staticNormal = CFG.BIKE_MASS * CFG.GRAVITY * dt;
+    const maxFriction = CFG.FRICTION * staticNormal + 50;
     jt = clamp(jt, -maxFriction, maxFriction);
 
     applyImpulse(tx*jt, ty*jt, rx, ry);
